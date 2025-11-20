@@ -29,10 +29,6 @@ interface SavedSlot {
 // 常量
 const GRID_SIZE = 8;
 const MAX_HISTORY = 14;
-const MAX_SLOTS = 10;
-
-// 模拟数据库存储
-const MOCK_DB_KEY = "angel_pixel_warmth_db";
 
 export default function PixelArtPage() {
   // --- 状态 ---
@@ -44,6 +40,7 @@ export default function PixelArtPage() {
   const [slots, setSlots] = useState<SavedSlot[]>([]);
   const [currentSlotId, setCurrentSlotId] = useState<number>(1);
   const [isDirty, setIsDirty] = useState(false);
+  const [isLoading, setIsLoading] = useState(true);
 
   // 颜色与工具状态
   const [color, setColor] = useState("#FF9F43"); // 默认暖色
@@ -61,50 +58,65 @@ export default function PixelArtPage() {
     setHistoryColors(["#FF9F43", "#FF6B6B", "#4ECDC4", "#1A535C", "#F7FFF7"]);
   }, []);
 
-  // 模拟从数据库加载槽位数据
-  useEffect(() => {
-    const loadSlots = () => {
-      try {
-        const saved = localStorage.getItem(MOCK_DB_KEY);
-        if (saved) {
-          let parsed = JSON.parse(saved);
-          
-          // 检查是否需要补充槽位
-          if (parsed.length < MAX_SLOTS) {
-            const currentLength = parsed.length;
-            const newSlots = Array.from({ length: MAX_SLOTS - currentLength }, (_, i) => ({
-              id: currentLength + i + 1,
-              name: `Slot ${currentLength + i + 1}`,
-              grid: Array(GRID_SIZE).fill(null).map(() => Array(GRID_SIZE).fill(null)),
-              lastModified: Date.now()
-            }));
-            parsed = [...parsed, ...newSlots];
-            localStorage.setItem(MOCK_DB_KEY, JSON.stringify(parsed));
-          }
+  // 从 API 加载槽位数据
+  const loadSlots = async () => {
+    try {
+      setIsLoading(true);
+      const res = await fetch('/api/slots');
+      if (res.ok) {
+        const data = await res.json();
+        // 处理 grid 中的 null/empty string
+        const parsedData = data.map((slot: any) => ({
+          ...slot,
+          grid: slot.grid.map((row: any[]) => row.map((cell: any) => cell === "" ? null : cell))
+        }));
 
-          setSlots(parsed);
-          // 加载第一个槽位的数据
-          if (parsed.length > 0) {
-            setGrid(parsed[0].grid);
+        setSlots(parsedData);
+        
+        // 如果当前有选中槽位，更新它的 grid，否则初始化第一个
+        const current = parsedData.find((s: SavedSlot) => s.id === currentSlotId);
+        if (current) {
+          setGrid(current.grid);
+        } else if (parsedData.length > 0) {
+          setGrid(parsedData[0].grid);
+          setCurrentSlotId(parsedData[0].id);
+        }
+      } else {
+        console.error('Failed to fetch slots');
+      }
+    } catch (e) {
+      console.error("Failed to load slots", e);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    loadSlots();
+  }, []);
+
+  // 轮询同步状态
+  useEffect(() => {
+    const checkSync = async () => {
+      try {
+        const res = await fetch('/api/sync');
+        if (res.ok) {
+          const { webVersion, deviceVersion } = await res.json();
+          // 如果网页版本大于设备版本，说明有更新未同步
+          if (webVersion > deviceVersion) {
+            setSyncStatus('pending');
+          } else {
+            setSyncStatus('synced');
           }
-        } else {
-          // 初始化默认槽位
-          const initialSlots: SavedSlot[] = Array.from({ length: MAX_SLOTS }, (_, i) => ({
-            id: i + 1,
-            name: `Slot ${i + 1}`,
-            grid: Array(GRID_SIZE).fill(null).map(() => Array(GRID_SIZE).fill(null)),
-            lastModified: Date.now()
-          }));
-          setSlots(initialSlots);
-          setGrid(initialSlots[0].grid);
-          // 保存初始数据到 DB
-          localStorage.setItem(MOCK_DB_KEY, JSON.stringify(initialSlots));
         }
       } catch (e) {
-        console.error("Failed to load slots", e);
+        console.error("Sync check failed", e);
       }
     };
-    loadSlots();
+
+    checkSync(); // 立即检查一次
+    const interval = setInterval(checkSync, 5000); // 每5秒检查一次
+    return () => clearInterval(interval);
   }, []);
 
   // 未保存提示
@@ -162,19 +174,44 @@ export default function PixelArtPage() {
   };
 
   // 保存当前槽位
-  const saveSlot = (slotId: number, gridData: GridData) => {
-    const updatedSlots = slots.map(s => 
-      s.id === slotId 
-        ? { ...s, grid: gridData, lastModified: Date.now() } 
-        : s
-    );
-    setSlots(updatedSlots);
-    
-    // MOCK DB CALL
-    localStorage.setItem(MOCK_DB_KEY, JSON.stringify(updatedSlots));
-    
-    setIsDirty(false);
-    console.log(`Saved slot ${slotId}`);
+  const saveSlot = async (slotId: number, gridData: GridData) => {
+    try {
+      // 乐观更新本地 UI
+      const updatedSlots = slots.map(s => 
+        s.id === slotId 
+          ? { ...s, grid: gridData, lastModified: Date.now() } 
+          : s
+      );
+      setSlots(updatedSlots);
+      setIsDirty(false);
+
+      // 发送到 API
+      // Convert nulls to empty strings for DB consistency if needed, 
+      // though our API handles mixed types, let's be explicit.
+      // Or just send as is since Mongoose Mixed handles null.
+      const res = await fetch('/api/slots', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          id: slotId,
+          name: `Slot ${slotId}`, // Maintain name logic
+          grid: gridData
+        })
+      });
+
+      if (res.ok) {
+        console.log(`Saved slot ${slotId}`);
+        // 触发一次同步检查以更新状态（虽然这里肯定是 pending 直到设备拉取）
+        setSyncStatus('pending'); 
+      } else {
+        alert("保存失败，请重试");
+        setIsDirty(true); // Revert dirty state
+      }
+    } catch (e) {
+      console.error("Save failed", e);
+      alert("保存出错");
+      setIsDirty(true);
+    }
   };
 
   // 切换槽位
@@ -182,7 +219,9 @@ export default function PixelArtPage() {
     if (currentSlotId === newSlotId) return;
 
     // 自动保存当前进度
-    saveSlot(currentSlotId, grid);
+    if (isDirty) {
+        saveSlot(currentSlotId, grid);
+    }
 
     // 加载新槽位
     const targetSlot = slots.find(s => s.id === newSlotId);
@@ -196,8 +235,6 @@ export default function PixelArtPage() {
   // 手动保存
   const handleManualSave = () => {
     saveSlot(currentSlotId, grid);
-    // 可以加一个 Toast 提示
-    alert("保存成功！");
   };
 
   // RGB 转换
@@ -207,6 +244,14 @@ export default function PixelArtPage() {
     const newRgb = { ...rgb, [key]: value };
     setColor(colord(newRgb).toHex());
   };
+
+  if (isLoading && slots.length === 0) {
+      return (
+          <div className="min-h-screen bg-stone-50 flex items-center justify-center text-stone-400">
+              加载中...
+          </div>
+      )
+  }
 
   return (
     <div className="min-h-screen bg-stone-50 text-stone-800 flex flex-col font-sans selection:bg-orange-200 relative">
@@ -235,7 +280,7 @@ export default function PixelArtPage() {
           <Palette size={32} />
         </div>
         <h1 className="text-4xl font-bold tracking-tight text-stone-800">Angelʻs Pixel Warmth</h1>
-        <p className="text-stone-500 font-medium">在 8x8 的小世界里，绘出你的温暖</p>
+        <p className="text-stone-500 font-medium">在 8x8 的像素世界里 绘制你的暖色調</p>
       </header>
 
       <main className="flex-1 w-full max-w-6xl mx-auto px-4 flex flex-col gap-8 items-center mb-24">
