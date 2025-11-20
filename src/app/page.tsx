@@ -29,7 +29,7 @@ interface SavedSlot {
 // 常量
 const GRID_SIZE = 8;
 const MAX_HISTORY = 14;
-const MAX_SLOTS = 9;
+const MAX_SLOTS = 10;
 
 // 模拟数据库存储
 const MOCK_DB_KEY = "angel_pixel_warmth_db";
@@ -67,7 +67,21 @@ export default function PixelArtPage() {
       try {
         const saved = localStorage.getItem(MOCK_DB_KEY);
         if (saved) {
-          const parsed = JSON.parse(saved);
+          let parsed = JSON.parse(saved);
+          
+          // 检查是否需要补充槽位
+          if (parsed.length < MAX_SLOTS) {
+            const currentLength = parsed.length;
+            const newSlots = Array.from({ length: MAX_SLOTS - currentLength }, (_, i) => ({
+              id: currentLength + i + 1,
+              name: `Slot ${currentLength + i + 1}`,
+              grid: Array(GRID_SIZE).fill(null).map(() => Array(GRID_SIZE).fill(null)),
+              lastModified: Date.now()
+            }));
+            parsed = [...parsed, ...newSlots];
+            localStorage.setItem(MOCK_DB_KEY, JSON.stringify(parsed));
+          }
+
           setSlots(parsed);
           // 加载第一个槽位的数据
           if (parsed.length > 0) {
